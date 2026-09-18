@@ -1,5 +1,6 @@
 import threading
 import time
+from multiprocessing import get_context
 
 import pytest
 
@@ -67,3 +68,34 @@ def test_rate_limit_cooldown_is_shared_and_blocks_loader(tmp_path):
             is_rate_limit=lambda exc: getattr(exc, "status_code", None) == 429,
         )
     assert calls == 1
+
+
+def _process_loader(path, ready, calls, result):
+    cache = SQLiteResponseCache(path, namespace="processes")
+    ready.wait()
+
+    def loader():
+        with calls.get_lock():
+            calls.value += 1
+        time.sleep(0.2)
+        return b"shared"
+
+    result.put(cache.get_or_set("same", loader, ttl=60))
+
+
+def test_same_key_load_is_coalesced_across_processes(tmp_path):
+    context = get_context("fork")
+    ready = context.Barrier(2)
+    calls = context.Value("i", 0)
+    results = context.Queue()
+    processes = [
+        context.Process(target=_process_loader, args=(tmp_path / "cache.sqlite3", ready, calls, results))
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(10)
+    assert all(process.exitcode == 0 for process in processes)
+    assert calls.value == 1
+    assert sorted(results.get() for _ in processes) == [(b"shared", False), (b"shared", True)]

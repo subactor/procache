@@ -5,6 +5,7 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -71,6 +72,15 @@ class SQLiteResponseCache:
             """)
             db.execute("CREATE INDEX IF NOT EXISTS responses_expiry ON responses(expires_at)")
             db.execute("""
+                CREATE TABLE IF NOT EXISTS flights (
+                    namespace TEXT NOT NULL,
+                    cache_key TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    PRIMARY KEY (namespace, cache_key)
+                )
+            """)
+            db.execute("""
                 CREATE TABLE IF NOT EXISTS cooldowns (
                     namespace TEXT NOT NULL,
                     cooldown_key TEXT NOT NULL,
@@ -132,27 +142,60 @@ class SQLiteResponseCache:
         cooldown_seconds: float = 60.0,
         is_rate_limit: Callable[[Exception], bool] | None = None,
     ) -> tuple[bytes, bool]:
-        """Return ``(value, hit)`` while coalescing same-key local callers."""
+        """Return ``(value, hit)`` while coalescing callers across processes."""
         if cooldown_key is not None:
             self.raise_if_cooling_down(cooldown_key)
         cached = self.get(key)
         if cached is not None:
             return cached.value, True
         with self._lock_for(f"{self.namespace}:{key}"):
-            if cooldown_key is not None:
-                self.raise_if_cooling_down(cooldown_key)
-            cached = self.get(key)
-            if cached is not None:
-                return cached.value, True
+            owner = uuid.uuid4().hex
+            while True:
+                if cooldown_key is not None:
+                    self.raise_if_cooling_down(cooldown_key)
+                cached = self.get(key)
+                if cached is not None:
+                    return cached.value, True
+                if self._claim_flight(key, owner):
+                    break
+                time.sleep(0.05)
             try:
-                value = loader()
-            except Exception as exc:
-                if cooldown_key is not None and is_rate_limit is not None and is_rate_limit(exc):
-                    self.cooldown(cooldown_key, ttl=cooldown_seconds)
-                raise
-            if should_cache is None or should_cache(value):
-                self.put(key, value, ttl=ttl, etag=etag)
-            return value, False
+                # A previous flight may have completed between the cache check
+                # and the claim if it was released just before our transaction.
+                cached = self.get(key)
+                if cached is not None:
+                    return cached.value, True
+                try:
+                    value = loader()
+                except Exception as exc:
+                    if cooldown_key is not None and is_rate_limit is not None and is_rate_limit(exc):
+                        self.cooldown(cooldown_key, ttl=cooldown_seconds)
+                    raise
+                if should_cache is None or should_cache(value):
+                    self.put(key, value, ttl=ttl, etag=etag)
+                return value, False
+            finally:
+                self._release_flight(key, owner)
+
+    def _claim_flight(self, key: str, owner: str, *, ttl: float = 120.0) -> bool:
+        now = time.time()
+        with self._connect() as db:
+            db.execute(
+                "DELETE FROM flights WHERE namespace=? AND cache_key=? AND expires_at<=?",
+                (self.namespace, key, now),
+            )
+            result = db.execute(
+                "INSERT OR IGNORE INTO flights(namespace,cache_key,owner,expires_at) VALUES(?,?,?,?)",
+                (self.namespace, key, owner, now + ttl),
+            )
+        return result.rowcount == 1
+
+    def _release_flight(self, key: str, owner: str) -> None:
+        with self._connect() as db:
+            db.execute(
+                "DELETE FROM flights WHERE namespace=? AND cache_key=? AND owner=?",
+                (self.namespace, key, owner),
+            )
 
     def cooldown(self, key: str, *, ttl: float) -> float:
         if ttl <= 0:
@@ -204,3 +247,4 @@ class SQLiteResponseCache:
         with self._connect() as db:
             db.execute("DELETE FROM responses WHERE namespace=?", (self.namespace,))
             db.execute("DELETE FROM cooldowns WHERE namespace=?", (self.namespace,))
+            db.execute("DELETE FROM flights WHERE namespace=?", (self.namespace,))
