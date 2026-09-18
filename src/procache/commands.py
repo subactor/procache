@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from .cache import SQLiteResponseCache
+from .cache import ProviderCooldownError, SQLiteResponseCache, is_rate_limit_error
 
 
 @dataclass(frozen=True)
@@ -25,6 +25,7 @@ class CachedReadCommand:
     def __init__(self, cache: SQLiteResponseCache, *, ttl: float = 15.0) -> None:
         self.cache = cache
         self.ttl = ttl
+        self.cooldown_seconds = 60.0
 
     @staticmethod
     def is_read(args: Sequence[str]) -> bool:
@@ -73,17 +74,25 @@ class CachedReadCommand:
         key = self.cache.key("command", argv, "scope", scope)
         def load() -> bytes:
             result = self._execute(argv, timeout=timeout, env=env)
+            if result.returncode and is_rate_limit_error(RuntimeError(result.stderr)):
+                self.cache.cooldown("provider", ttl=self.cooldown_seconds)
             return json.dumps(
                 {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr},
                 separators=(",", ":"),
             ).encode()
 
-        value, hit = self.cache.get_or_set(
-            key,
-            load,
-            ttl=self.ttl,
-            should_cache=lambda payload: json.loads(payload)["returncode"] == 0,
-        )
+        try:
+            value, hit = self.cache.get_or_set(
+                key,
+                load,
+                ttl=self.ttl,
+                should_cache=lambda payload: json.loads(payload)["returncode"] == 0,
+                cooldown_key="provider",
+                cooldown_seconds=self.cooldown_seconds,
+                is_rate_limit=is_rate_limit_error,
+            )
+        except ProviderCooldownError as exc:
+            return CachedCommandResult(argv, 75, "", str(exc))
         result = json.loads(value)
         return CachedCommandResult(
             argv,

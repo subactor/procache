@@ -18,6 +18,29 @@ class CacheEntry:
     etag: str | None = None
 
 
+class ProviderCooldownError(RuntimeError):
+    """Raised while a provider rate-limit cooldown is active."""
+
+    def __init__(self, provider: str, remaining: float) -> None:
+        self.provider = provider
+        self.remaining = max(0.0, remaining)
+        super().__init__(f"provider {provider!r} is cooling down for {self.remaining:.1f}s")
+
+
+def is_rate_limit_error(error: Exception) -> bool:
+    """Recognize common 429/secondary-limit provider errors without dependencies."""
+    status = getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(error, "status", None)
+    if status is None:
+        status = getattr(error, "code", None)
+    if status == 429:
+        return True
+    return status == 403 and any(
+        marker in str(error).lower() for marker in ("rate limit", "rate-limit", "retry-after", "secondary limit")
+    )
+
+
 class SQLiteResponseCache:
     """A bounded persistent cache for provider reads.
 
@@ -47,6 +70,15 @@ class SQLiteResponseCache:
                 )
             """)
             db.execute("CREATE INDEX IF NOT EXISTS responses_expiry ON responses(expires_at)")
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS cooldowns (
+                    namespace TEXT NOT NULL,
+                    cooldown_key TEXT NOT NULL,
+                    until_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (namespace, cooldown_key)
+                )
+            """)
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=30, isolation_level="IMMEDIATE")
@@ -96,19 +128,67 @@ class SQLiteResponseCache:
         ttl: float,
         etag: str | None = None,
         should_cache: Callable[[bytes], bool] | None = None,
+        cooldown_key: str | None = None,
+        cooldown_seconds: float = 60.0,
+        is_rate_limit: Callable[[Exception], bool] | None = None,
     ) -> tuple[bytes, bool]:
         """Return ``(value, hit)`` while coalescing same-key local callers."""
+        if cooldown_key is not None:
+            self.raise_if_cooling_down(cooldown_key)
         cached = self.get(key)
         if cached is not None:
             return cached.value, True
         with self._lock_for(f"{self.namespace}:{key}"):
+            if cooldown_key is not None:
+                self.raise_if_cooling_down(cooldown_key)
             cached = self.get(key)
             if cached is not None:
                 return cached.value, True
-            value = loader()
+            try:
+                value = loader()
+            except Exception as exc:
+                if cooldown_key is not None and is_rate_limit is not None and is_rate_limit(exc):
+                    self.cooldown(cooldown_key, ttl=cooldown_seconds)
+                raise
             if should_cache is None or should_cache(value):
                 self.put(key, value, ttl=ttl, etag=etag)
             return value, False
+
+    def cooldown(self, key: str, *, ttl: float) -> float:
+        if ttl <= 0:
+            raise ValueError("cooldown TTL must be positive")
+        until = time.time() + ttl
+        with self._connect() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO cooldowns(namespace,cooldown_key,until_at,updated_at) "
+                "VALUES(?,?,?,?)",
+                (self.namespace, key, until, time.time()),
+            )
+        return until
+
+    def cooldown_remaining(self, key: str, *, now: float | None = None) -> float:
+        moment = time.time() if now is None else now
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT until_at FROM cooldowns WHERE namespace=? AND cooldown_key=?",
+                (self.namespace, key),
+            ).fetchone()
+        if row is None:
+            return 0.0
+        remaining = float(row[0]) - moment
+        if remaining <= 0:
+            with self._connect() as db:
+                db.execute(
+                    "DELETE FROM cooldowns WHERE namespace=? AND cooldown_key=?",
+                    (self.namespace, key),
+                )
+            return 0.0
+        return remaining
+
+    def raise_if_cooling_down(self, key: str) -> None:
+        remaining = self.cooldown_remaining(key)
+        if remaining > 0:
+            raise ProviderCooldownError(self.namespace, remaining)
 
     def prune(self, *, now: float | None = None) -> int:
         moment = time.time() if now is None else now
@@ -118,3 +198,9 @@ class SQLiteResponseCache:
                 (self.namespace, moment),
             )
         return int(result.rowcount)
+
+    def clear(self) -> None:
+        """Drop cached reads and cooldowns for this provider namespace."""
+        with self._connect() as db:
+            db.execute("DELETE FROM responses WHERE namespace=?", (self.namespace,))
+            db.execute("DELETE FROM cooldowns WHERE namespace=?", (self.namespace,))
