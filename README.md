@@ -21,3 +21,9 @@ result = runner.run(["gh", "pr", "view", "136", "--json", "state"])
 ```
 
 Mutating commands must continue to use the existing command runner directly.
+
+When a provider returns a recognized rate-limit error, the cache records a
+shared cooldown (60 seconds by default). Other processes using the same cache
+namespace fail locally during that window instead of starting another request
+storm. The PyGithub adapter is available as `CachedPyGithubRequester` for
+libraries that delegate REST transport to PyGithub.
