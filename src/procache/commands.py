@@ -34,7 +34,7 @@ class CachedReadCommand:
         if len(argv) >= 3 and argv[1] == "search":
             return argv[2] in {"prs", "issues", "repos", "commits", "code"}
         if len(argv) >= 3 and argv[1] in {"pr", "issue", "repo"}:
-            return argv[2] in {"list", "view", "status", "checks", "diff"}
+            return argv[2] in {"list", "view", "status", "checks"}
         if len(argv) >= 2 and argv[1] == "api":
             method = "GET"
             if "--method" in argv:
