@@ -35,7 +35,7 @@ def is_rate_limit_error(error: Exception) -> bool:
         status = getattr(error, "status", None)
     if status is None:
         status = getattr(error, "code", None)
-    if status == 429:
+    if status == 429 or "429" in str(error):
         return True
     return status == 403 and any(
         marker in str(error).lower() for marker in ("rate limit", "rate-limit", "retry-after", "secondary limit")
