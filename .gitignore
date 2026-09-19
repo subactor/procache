@@ -3,3 +3,23 @@ __pycache__/
 .pytest_cache/
 *.sqlite3
 /.worktrees/
+
+!.github/
+!.github/**
+!.cursor/
+!.cursor/**
+!.cursor*
+!.aider*
+!.aider.conf.yml
+!scripts/
+!scripts/**
+!project/
+!project/**
+
+# Repository-local worktrees and operational state
+/.subactor/leases/
+/.subactor/sessions/
+/.subactor/recovery/
+/.subactor/receipts/
+/.subactor/cache/
+/.subactor/snapshots/

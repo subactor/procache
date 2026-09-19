@@ -13,9 +13,15 @@ license = {text = "Apache-2.0"}
 where = ["src"]
 
 [tool.pytest.ini_options]
+addopts = "-p wellmanifest_governance"
 testpaths = ["tests"]
 pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+
+[tool.wellmanifest]
+standard = "0.20.35"
+revision = "cfaa0bf0ea6b0e7349fed0bb62b5ce15792d687d"
+gate = "project/governance-check.sh"
