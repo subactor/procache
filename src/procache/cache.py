@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -35,11 +36,14 @@ def is_rate_limit_error(error: Exception) -> bool:
         status = getattr(error, "status", None)
     if status is None:
         status = getattr(error, "code", None)
-    if status == 429 or "429" in str(error):
+    message = str(error).lower()
+    if status == 429 or re.search(r"\bhttp(?:/\d(?:\.\d)?)?[ :]+429\b", message):
         return True
-    return status == 403 and any(
-        marker in str(error).lower() for marker in ("rate limit", "rate-limit", "retry-after", "secondary limit")
-    )
+    headers = getattr(error, "headers", None)
+    headers = {str(k).lower(): str(v) for k, v in headers.items()} if isinstance(headers, dict) else {}
+    if status == 403 and (headers.get("x-ratelimit-remaining") == "0" or "retry-after" in headers):
+        return True
+    return any(marker in message for marker in ("rate limit", "rate-limit", "secondary limit", "abuse detection"))
 
 
 class SQLiteResponseCache:
