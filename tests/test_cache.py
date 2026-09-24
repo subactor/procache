@@ -99,3 +99,37 @@ def test_same_key_load_is_coalesced_across_processes(tmp_path):
     assert all(process.exitcode == 0 for process in processes)
     assert calls.value == 1
     assert sorted(results.get() for _ in processes) == [(b"shared", False), (b"shared", True)]
+
+
+def test_injected_clock_controls_expiry_and_cooldown(tmp_path):
+    moments = [1_000.0]
+    cache = SQLiteResponseCache(
+        tmp_path / "cache.sqlite3", namespace="github", clock=lambda: moments[0]
+    )
+    key = cache.key("GET", "/user")
+    cache.put(key, b"payload", ttl=15)
+    assert cache.get(key).value == b"payload"
+    cache.cooldown("provider", ttl=60)
+    assert cache.cooldown_remaining("provider") == pytest.approx(60.0)
+    moments[0] += 16
+    assert cache.get(key) is None
+    assert cache.cooldown_remaining("provider") == pytest.approx(44.0)
+    moments[0] += 45
+    assert cache.cooldown_remaining("provider") == 0.0
+
+
+def test_injected_clock_applies_to_get_or_set(tmp_path):
+    moments = [2_000.0]
+    calls = []
+
+    def loader():
+        calls.append(1)
+        return b"value"
+
+    first = SQLiteResponseCache(tmp_path / "cache.sqlite3", clock=lambda: moments[0])
+    second = SQLiteResponseCache(tmp_path / "cache.sqlite3", clock=lambda: moments[0])
+    assert first.get_or_set("k", loader, ttl=15) == (b"value", False)
+    assert second.get_or_set("k", loader, ttl=15) == (b"value", True)
+    moments[0] += 16
+    assert second.get_or_set("k", loader, ttl=15) == (b"value", False)
+    assert len(calls) == 2

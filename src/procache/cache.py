@@ -58,9 +58,16 @@ class SQLiteResponseCache:
     _locks: dict[str, threading.Lock] = {}
     _locks_guard = threading.Lock()
 
-    def __init__(self, path: str | Path, *, namespace: str = "default") -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        namespace: str = "default",
+        clock: Callable[[], float] | None = None,
+    ) -> None:
         self.path = Path(path)
         self.namespace = namespace
+        self._clock = time.time if clock is None else clock
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.execute("""
@@ -111,7 +118,7 @@ class SQLiteResponseCache:
         return hashlib.sha256(encoded.encode()).hexdigest()
 
     def get(self, key: str, *, now: float | None = None) -> CacheEntry | None:
-        moment = time.time() if now is None else now
+        moment = self._clock() if now is None else now
         with self._connect() as db:
             row = db.execute(
                 "SELECT cache_key, value, expires_at, etag FROM responses "
@@ -125,12 +132,12 @@ class SQLiteResponseCache:
     def put(self, key: str, value: bytes, *, ttl: float, etag: str | None = None) -> CacheEntry:
         if ttl <= 0:
             raise ValueError("cache TTL must be positive")
-        expires_at = time.time() + ttl
+        expires_at = self._clock() + ttl
         with self._connect() as db:
             db.execute(
                 "INSERT OR REPLACE INTO responses(namespace,cache_key,value,expires_at,etag,updated_at) "
                 "VALUES(?,?,?,?,?,?)",
-                (self.namespace, key, sqlite3.Binary(value), expires_at, etag, time.time()),
+                (self.namespace, key, sqlite3.Binary(value), expires_at, etag, self._clock()),
             )
         return CacheEntry(key=key, value=value, expires_at=expires_at, etag=etag)
 
@@ -182,7 +189,7 @@ class SQLiteResponseCache:
                 self._release_flight(key, owner)
 
     def _claim_flight(self, key: str, owner: str, *, ttl: float = 120.0) -> bool:
-        now = time.time()
+        now = self._clock()
         with self._connect() as db:
             db.execute(
                 "DELETE FROM flights WHERE namespace=? AND cache_key=? AND expires_at<=?",
@@ -204,17 +211,17 @@ class SQLiteResponseCache:
     def cooldown(self, key: str, *, ttl: float) -> float:
         if ttl <= 0:
             raise ValueError("cooldown TTL must be positive")
-        until = time.time() + ttl
+        until = self._clock() + ttl
         with self._connect() as db:
             db.execute(
                 "INSERT OR REPLACE INTO cooldowns(namespace,cooldown_key,until_at,updated_at) "
                 "VALUES(?,?,?,?)",
-                (self.namespace, key, until, time.time()),
+                (self.namespace, key, until, self._clock()),
             )
         return until
 
     def cooldown_remaining(self, key: str, *, now: float | None = None) -> float:
-        moment = time.time() if now is None else now
+        moment = self._clock() if now is None else now
         with self._connect() as db:
             row = db.execute(
                 "SELECT until_at FROM cooldowns WHERE namespace=? AND cooldown_key=?",
@@ -238,7 +245,7 @@ class SQLiteResponseCache:
             raise ProviderCooldownError(self.namespace, remaining)
 
     def prune(self, *, now: float | None = None) -> int:
-        moment = time.time() if now is None else now
+        moment = self._clock() if now is None else now
         with self._connect() as db:
             result = db.execute(
                 "DELETE FROM responses WHERE namespace=? AND expires_at<=?",
